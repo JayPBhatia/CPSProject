@@ -32,7 +32,30 @@
 import csv
 import time
 
+import joblib
+import pandas as pd
+import tensorflow as tf
 import zmq
+import warnings
+
+warnings.filterwarnings('ignore')
+
+from numpy import array
+
+
+def split_sequences(sequences, n_steps):
+    X, y = list(), list()
+    for i in range(len(sequences)):
+        # find the end of this pattern
+        end_ix = i + n_steps
+        # check if we are beyond the dataset
+        if end_ix > len(sequences):
+            break
+        # gather input and output parts of the pattern
+        seq_x, seq_y = sequences[i:end_ix, :-1], sequences[end_ix - 1, -1]
+        X.append(seq_x)
+        y.append(seq_y)
+    return array(X), array(y)
 
 
 def consumerIP(context, ipAddressAndPort, topic):
@@ -161,41 +184,80 @@ def main():
     detector = DetZMQ()
     detector.setup()
 
-    lastValue = 0
-    fileName = 'AllData_' + str(int(time.time())) + '.csv'
-    with open(fileName, 'a', newline='', buffering=1) as csvfile:
-        while True:
-            PlantState = detector.getState()
-            w = csv.DictWriter(csvfile, PlantState.keys())
-            if lastValue == 0:
-                w.writeheader()
-            print(f"UV401-{PlantState['UV401']}, "
-                  f" P401={PlantState['P401']}, "
-                  f" P501={PlantState['P501']}, "
-                  f" AIT402={PlantState['AIT402']}")
+    cols = ['FIT201', 'FIT301', 'LIT301', 'FIT_Diff', 'LIT_Diff']
+    df = pd.DataFrame(columns=cols)
 
-            if (lastValue != 0 and
-                    PlantState['UV401'] != 2 and
-                    PlantState['P401'] == 2):
+    x_scaler = joblib.load('x_scaler.save')
+    y_scaler = joblib.load('y_scaler.save')
+
+    model = tf.keras.models.load_model('lit301.h5')
+
+    last_value = 0
+    last_lit301_value = -1
+    n_steps = 32
+    file_name = 'AllData_' + str(int(time.time())) + '.csv'
+    with open(file_name, 'a', newline='', buffering=1) as csvfile:
+        print("starting while true loop....")
+        while True:
+            plant_state = detector.getState()
+            w = csv.DictWriter(csvfile, plant_state.keys())
+            if last_value == 0:
+                w.writeheader()
+
+            if last_lit301_value != -1:
+                litdiff = plant_state['LIT301'] - last_lit301_value
+                data = [plant_state['FIT201'], plant_state['FIT301'], plant_state['LIT301'],
+                        plant_state['FIT201'] - plant_state['FIT301'], litdiff]
+                print(data)
+                df.loc[len(df)] = data
+
+                if df.shape[0] >= n_steps:
+                    df_scaled = df.copy()
+                    print(df_scaled.iloc[-1:, :])
+                    df_scaled[cols[:-1]] = pd.DataFrame(x_scaler.transform(df[cols[:-1]]))
+                    df_scaled[cols[-1]] = pd.DataFrame(y_scaler.transform(df[cols[-1]].values.reshape(-1, 1)))
+                    X, y = split_sequences(df_scaled.values, n_steps)
+                    loss, mse, mae = model.evaluate(X, y, verbose=0)
+                    print(loss, mse, mae)
+                    y_pred = model.predict(X)
+                    y_inv = y_scaler.inverse_transform(y.reshape(-1, 1))
+                    y_pred_inv = y_scaler.inverse_transform(y_pred.reshape(-1, 1))
+                    print(y_pred_inv[-1][0], litdiff)
+
+                    if (abs(y_pred_inv[-1][0] - litdiff)) > 0.04:
+                        # last value of LIT need to be corrected as per prediction
+                        #df[cols[-1]][-1] = df[cols[-1]][-2]+y_pred_inv[-1][0]
+                        print("**********************Seems to be in Attack Mode for LIT301**********************")
+
+            last_lit301_value = plant_state['LIT301']
+
+            print(f"UV401-{plant_state['UV401']}, "
+                  f" P401={plant_state['P401']}, "
+                  f" P501={plant_state['P501']}, "
+                  f" AIT402={plant_state['AIT402']}")
+
+            if (last_value != 0 and
+                    plant_state['UV401'] != 2 and
+                    plant_state['P401'] == 2):
                 print("**********************Seems to be in Attack Mode for UV401**********************")
 
-            print(f"P401-{PlantState['P401']}, "
-                  f" P402={PlantState['P402']}, "
-                  f" FIT301={PlantState['FIT301']}, "
-                  f" MV302={PlantState['MV302']} "
-                  f" LIT401={PlantState['LIT401']} "
-                  f" diff={lastValue - PlantState['LIT401']}")
+            print(f"P401-{plant_state['P401']}, "
+                  f" P402={plant_state['P402']}, "
+                  f" FIT301={plant_state['FIT301']}, "
+                  f" MV302={plant_state['MV302']} "
+                  f" LIT401={plant_state['LIT401']} "
+                  f" diff={last_value - plant_state['LIT401']}")
 
-            if (lastValue != 0 and
-                    PlantState['P401'] != 2 and
-                    PlantState['P402'] != 2 and
-                    PlantState['MV302'] == 2 and
-                    PlantState['FIT301'] >= 1 >= (lastValue - PlantState['LIT401'])):
+            if (last_value != 0 and
+                    plant_state['P401'] != 2 and
+                    plant_state['P402'] != 2 and
+                    plant_state['MV302'] == 2 and
+                    plant_state['FIT301'] >= 1 >= (last_value - plant_state['LIT401'])):
                 print("**********************Seems to be in Attack Mode on LIT401**********************")
 
-            lastValue = PlantState['LIT401']
+            last_value = plant_state['LIT401']
 
-            w.writerow(PlantState)
+            w.writerow(plant_state)
             csvfile.flush()
 
 
