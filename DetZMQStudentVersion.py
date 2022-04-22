@@ -33,6 +33,7 @@ import csv
 import time
 
 import joblib
+import numpy as np
 import pandas as pd
 import tensorflow as tf
 import zmq
@@ -184,9 +185,6 @@ def main():
     detector = DetZMQ()
     detector.setup()
 
-    cols = ['FIT201', 'FIT301', 'LIT301', 'FIT_Diff', 'LIT_Diff']
-    df = pd.DataFrame(columns=cols)
-
     x_scaler = joblib.load('x_scaler.save')
     y_scaler = joblib.load('y_scaler.save')
 
@@ -194,7 +192,11 @@ def main():
 
     last_value = 0
     last_lit301_value = -1
+    update_last_lit301 = True
     n_steps = 32
+    data = []
+    cols = ['FIT201', 'FIT301', 'LIT301', 'FIT_Diff', 'LIT_Diff']
+
     file_name = 'AllData_' + str(int(time.time())) + '.csv'
     with open(file_name, 'a', newline='', buffering=1) as csvfile:
         print("starting while true loop....")
@@ -205,31 +207,44 @@ def main():
                 w.writeheader()
 
             if last_lit301_value != -1:
-                litdiff = plant_state['LIT301'] - last_lit301_value
-                data = [plant_state['FIT201'], plant_state['FIT301'], plant_state['LIT301'],
-                        plant_state['FIT201'] - plant_state['FIT301'], litdiff]
-                print(data)
-                df.loc[len(df)] = data
+                lit_diff = plant_state['LIT301'] - last_lit301_value
+                data.append([plant_state['FIT201'], plant_state['FIT301'], plant_state['LIT301'],
+                             plant_state['FIT201'] - plant_state['FIT301'], lit_diff])
+                print(data[-1])
 
-                if df.shape[0] >= n_steps:
-                    df_scaled = df.copy()
-                    print(df_scaled.iloc[-1:, :])
-                    df_scaled[cols[:-1]] = pd.DataFrame(x_scaler.transform(df[cols[:-1]]))
-                    df_scaled[cols[-1]] = pd.DataFrame(y_scaler.transform(df[cols[-1]].values.reshape(-1, 1)))
-                    X, y = split_sequences(df_scaled.values, n_steps)
+                if len(data) >= n_steps:
+                    df = pd.DataFrame(data, columns=cols)
+                    df[cols[:-1]] = x_scaler.transform(df[cols[:-1]])
+                    df[cols[-1]] = y_scaler.transform(df[cols[-1]].values.reshape(-1, 1))
+                    X, y = split_sequences(df.values, n_steps)
                     loss, mse, mae = model.evaluate(X, y, verbose=0)
                     print(loss, mse, mae)
                     y_pred = model.predict(X)
                     y_inv = y_scaler.inverse_transform(y.reshape(-1, 1))
                     y_pred_inv = y_scaler.inverse_transform(y_pred.reshape(-1, 1))
-                    print(y_pred_inv[-1][0], litdiff)
+                    print(f" Predicted LIT301-Diff:{y_pred_inv[-1][0]}, Published LIT301-Diff:{y_inv[-1][0]}, "
+                          f" Error:{abs(y_pred_inv[-1][0]-y_inv[-1][0])}")
 
-                    if (abs(y_pred_inv[-1][0] - litdiff)) > 0.04:
-                        # last value of LIT need to be corrected as per prediction
-                        #df[cols[-1]][-1] = df[cols[-1]][-2]+y_pred_inv[-1][0]
+                    # last value of LIT need to be corrected as per prediction
+                    # df[cols[-1]][-1] = df[cols[-1]][-2]+y_pred_inv[-1][0]
+                    if (abs(y_pred_inv[-1][0] - y_inv[-1][0])) > 1:
                         print("**********************Seems to be in Attack Mode for LIT301**********************")
+                        data.pop()
+                        data.append([plant_state['FIT201'], plant_state['FIT301'], last_lit301_value+y_pred_inv[-1][0],
+                             plant_state['FIT201'] - plant_state['FIT301'], y_pred_inv[-1][0]])
 
-            last_lit301_value = plant_state['LIT301']
+                        print(
+                            f"Updating  last_lit301_value{last_lit301_value} using Prediction  {last_lit301_value+y_pred_inv[-1][0]},")
+                        last_lit301_value = last_lit301_value+y_pred_inv[-1][0]
+                        update_last_lit301 = False
+                    else:
+                        data.pop(0)
+                        update_last_lit301 = True
+
+            if update_last_lit301:
+                print(f"Updating  last_lit301_value{last_lit301_value} plant_state['LIT301']  {plant_state['LIT301']},")
+                last_lit301_value = plant_state['LIT301']
+
 
             print(f"UV401-{plant_state['UV401']}, "
                   f" P401={plant_state['P401']}, "
